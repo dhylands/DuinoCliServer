@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -31,11 +32,13 @@
 #include <sys/unistd.h>
 #include <termios.h>
 
+#include "Bus.h"
+#include "CorePacketHandler.h"
 #include "DumpMem.h"
 #include "LinuxColorLog.h"
+#include "LinuxSerialBus.h"
 #include "Log.h"
-
-static constexpr in_port_t DEFAULT_PORT = 8888;
+#include "SocketBus.h"
 
 enum {
     // Options assigned a single character code can use that charater code
@@ -43,6 +46,7 @@ enum {
 
     OPT_DEBUG = 'd',
     OPT_PORT = 'p',
+    OPT_SERIAL = 's',
     OPT_VERBOSE = 'v',
     OPT_HELP = 'h',
 
@@ -60,6 +64,7 @@ struct option g_long_option[] = {
     {"debug",       no_argument,        nullptr,    OPT_DEBUG},
     {"help",        no_argument,        nullptr,    OPT_HELP},
     {"port",        required_argument,  nullptr,    OPT_PORT},
+    {"serial",      required_argument,  nullptr,    OPT_SERIAL},
     {"verbose",     no_argument,        nullptr,    OPT_VERBOSE},
     {},
     // clang-format on
@@ -82,7 +87,8 @@ int main(
 ) {
     auto log = LinuxColorLog(stdout);
 
-    in_port_t port = DEFAULT_PORT;
+    char const* portStr = SocketBus::DEFAULT_PORT_STR;
+    char const* serialPortStr = "";
 
     // Figure out which directory our executable came from
 
@@ -121,8 +127,12 @@ int main(
             }
 
             case OPT_PORT: {
-                const char* port_str = optarg;
-                port = atoi(port_str);
+                portStr = optarg;
+                break;
+            }
+
+            case OPT_SERIAL: {
+                serialPortStr = optarg;
                 break;
             }
 
@@ -140,55 +150,73 @@ int main(
 
     if (g_verbose) {
         Log::debug("g_debug = %d", g_debug);
-        Log::debug("port = %d", port);
+        Log::debug("portStr = %s", portStr);
     }
 
-    int listen_socket;
-    if ((listen_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        Log::error("Call to socket failed: '%s'", strerror(errno));
-        exit(1);
-    }
-    int enable = 1;
-    if (setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
-        Log::error("Failed to set REUSEADDR socket option: %s", strerror(errno));
-        exit(1);
-    }
+    uint8_t cmdPacketData[256];
+    uint8_t rspPacketData[256];
+    Packet cmdPacket(LEN(cmdPacketData), cmdPacketData);
+    Packet rspPacket(LEN(rspPacketData), rspPacketData);
+    SocketBus socketBus(&cmdPacket, &rspPacket);
+    LinuxSerialBus serialBus(&cmdPacket, &rspPacket);
 
-    struct sockaddr_in server;
-    memset(&server, 0, sizeof(server));
-    server.sin_port = htons(port);
-    server.sin_addr.s_addr = INADDR_ANY;
-    server.sin_family = AF_INET;
+    socketBus.setDebug(true);
+    serialBus.setDebug(true);
 
-    if (bind(listen_socket, (const sockaddr*)&server, sizeof(server)) < 0) {
-        Log::error("Failed to bind to port: %d: %s", port, strerror(errno));
-        exit(1);
-    }
+    CorePacketHandler corePacketHandler;
+    int fd = -1;
 
-    Log::info("Listening on port %d ...", port);
-    if (listen(listen_socket, 1) < 0) {
-        Log::error("Failed to listen for incoming connection: %s", strerror(errno));
-    }
-
-    struct sockaddr_in client;
-    memset(&client, 0, sizeof(client));
-    socklen_t client_len = sizeof(client);
-    int socket;
-    if ((socket = accept(listen_socket, (sockaddr*)&client, &client_len)) < 0) {
-        Log::error("Failed to accept incoming connection: %s", strerror(errno));
-        exit(1);
-    }
-    printf("Accepted connection from %s:%d", inet_ntoa(client.sin_addr), ntohs(client.sin_port));
-
-    ssize_t bytesRcvd;
-    uint8_t buf[1024];
-    while ((bytesRcvd = recv(socket, buf, sizeof(buf), 0)) > 0) {
-        DumpMem("R", 0, buf, bytesRcvd);
-        // gadget.ProcessBytes(buf, bytesRcvd);
+    IBus* bus = nullptr;
+    if (serialPortStr[0] == '\0') {
+        socketBus.add(corePacketHandler);
+        if (socketBus.setupServer(portStr) != IBus::Error::NONE) {
+            exit(1);
+        }
+        fd = socketBus.socket();
+        bus = &socketBus;
+    } else {
+        serialBus.add(corePacketHandler);
+        printf("Opening serial port\n");
+        if (serialBus.open(serialPortStr, 115200) != IBus::Error::NONE) {
+            exit(1);
+        }
+        printf("Serial port opened\n");
+        fd = serialBus.serial();
+        bus = &serialBus;
     }
 
-    close(socket);
-    close(listen_socket);
+    while (true) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        if (poll(&pfd, 1, -1) < 0) {
+            Log::error("Poll failed: %s", strerror(errno));
+            break;
+        }
+        if (pfd.revents == 0) {
+            continue;
+        }
+        if ((pfd.revents & POLLRDHUP) != 0) {
+            Log::info("Remote disconnected");
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            Log::error("Unexexpected poll revent: 0x%04x", static_cast<unsigned int>(pfd.revents));
+            continue;
+        }
+
+        if (auto rc = bus->processByte(); rc != Packet::Error::NONE) {
+            if (rc != Packet::Error::NOT_DONE) {
+                Log::error("Error processing packet: %s", as_str(rc));
+            }
+            continue;
+        }
+
+        // We've parsed a packet.
+        bus->handlePacket();
+    }
 
     if (g_verbose) {
         Log::debug("Done");
@@ -206,5 +234,6 @@ void usage() {
     Log::info("%s", "");
     Log::info("  -d, --debug       Turn on debug output");
     Log::info("  -h, --help        Display this message");
+    Log::info("  -p, --port PORT   Port to run server on");
     Log::info("  -v, --verbose     Turn on verbose messages");
 }
